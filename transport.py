@@ -22,26 +22,29 @@ class ReadMode:
     TIMEOUT = 2
 
 class Packet:
-    def __init__(self, seq=0, ack=0, flags=0, payload=b"", win=0):
+    def __init__(self, seq=0, ack=0, flags=0, payload=b"", win=0, sack_left=0, sack_right=0):
         self.seq = seq          # Sequence number of first byte in payload
         self.ack = ack          # Cumulative acknowledgment (next expected byte)
         self.flags = flags      # Control flags (SYN, ACK, FIN, SACK)
         self.payload = payload  # Data payload (bytes)
         self.win = win          # Advertised window (receiver buffer space)
+        # SACK block information
+        self.sack_left = sack_left    # Selective acknowledgment left boundary
+        self.sack_right = sack_right  # Selective acknowledgment right boundary
 
     def encode(self):
         """Encode the packet header and payload into bytes (network byte order)."""
-        # Pack header fields: seq (32b), ack (32b), flags (32b), win (16b), payload_len (16b)
-        header = struct.pack("!IIIHH", self.seq, self.ack, self.flags, self.win, len(self.payload))
+        # Pack header fields: seq (32b), ack (32b), flags (32b), win (16b), payload_len (16b), sack_left (32b), sack_right (32b)
+        header = struct.pack("!IIIHHII", self.seq, self.ack, self.flags, self.win, len(self.payload), self.sack_left, self.sack_right)
         return header + self.payload
 
     @staticmethod
     def decode(data):
         """Decode bytes into a Packet object (assumes fixed header format)."""
-        header_size = struct.calcsize("!IIIHH")
-        seq, ack, flags, win, payload_len = struct.unpack("!IIIHH", data[:header_size])
+        header_size = struct.calcsize("!IIIHHII")
+        seq, ack, flags, win, payload_len, sack_left, sack_right = struct.unpack("!IIIHHII", data[:header_size])
         payload = data[header_size:]
-        return Packet(seq, ack, flags, payload, win=win)
+        return Packet(seq, ack, flags, payload, win=win, sack_left=sack_left, sack_right=sack_right)
 
 class TransportSocket:
     def __init__(self):
@@ -62,7 +65,7 @@ class TransportSocket:
             "recv_len": 0,            # Number of bytes in receive buffer
             "next_seq_to_send": 0     # Sequence number for the next new byte we send
         }
-        self.peer_adv_wnd = MAX_NETWORK_BUFFER  # Peer’s advertised window (flow control)
+        self.peer_adv_wnd = MAX_NETWORK_BUFFER  # Peer's advertised window (flow control)
         self.state = "CLOSED"                   # Connection state (FSM)
         self.sock_type = None
         self.conn = None       # Peer address (IP, port)
@@ -72,6 +75,11 @@ class TransportSocket:
         self.timeout_interval = DEFAULT_TIMEOUT # Current retransmission timeout (seconds)
         # Buffer for unacknowledged segments (seq -> segment info)
         self.inflight = {}      # Tracks sent but not yet ACKed segments
+        # Receive buffer for out-of-order segments
+        self.ooo_segments = {}  # Out-of-order segment buffer {seq: (data_len, data)}
+        # Fast retransmit variables
+        self.dup_ack_count = 0  # Duplicate ACK count
+        self.last_ack_recv = 0  # Last received ACK number
 
     def socket(self, sock_type, port, server_ip=None):
         """
@@ -302,6 +310,30 @@ class TransportSocket:
                     else:
                         self.estimated_rtt = (1 - ALPHA) * self.estimated_rtt + ALPHA * sample_rtt
                     self.timeout_interval = 2 * self.estimated_rtt
+
+            # Process SACK information (if any) - retransmit lost segments indicated by SACK
+            if hasattr(self, "last_sack_info") and self.last_sack_info:
+                sack_left, sack_right = self.last_sack_info
+                if sack_left > 0 and sack_right > sack_left:
+                    # Indicates a hole in the SACK block
+                    hole_start = self.window["next_seq_expected"]
+                    hole_end = sack_left
+                    # Re-transmit segments in this hole
+                    retrans_candidates = [s for s in self.inflight.keys() 
+                                        if s >= hole_start and s < hole_end]
+                    if retrans_candidates:
+                        # Re-transmit lost segments based on SACK information
+                        seq = retrans_candidates[0]  # Take the first segment to re-transmit
+                        seg_info = self.inflight[seq]
+                        print(f"SACK indicated retransmission (seq={seq})")
+                        segment = Packet(seq=seq, ack=self.window["last_ack"], flags=0,
+                                        payload=seg_info["payload"],
+                                        win=MAX_NETWORK_BUFFER - self.window["recv_len"])
+                        self.sock_fd.sendto(segment.encode(), self.conn)
+                        seg_info["trans"] += 1
+                        seg_info["send_time"] = time.time()
+                        seg_info["rtt_valid"] = False
+
         if self.window["next_seq_expected"] >= end_seq:
             print("All data acknowledged by peer.")
 
@@ -316,7 +348,7 @@ class TransportSocket:
                 continue
             except Exception as e:
                 if not self.dying:
-                    print(f"Error in backend: {e}")
+                    print(f"后台错误: {e}")
                 continue
 
             packet = Packet.decode(data)
@@ -364,36 +396,111 @@ class TransportSocket:
                 continue
 
             # ACK processing
-            if (packet.flags & ACK_FLAG) != 0:
+            if packet.flags & ACK_FLAG:
                 if self.state == "FIN_SENT" and packet.ack >= self.window["next_seq_to_send"]:
-                    print("Received ACK for FIN.")
+                    print("收到FIN的ACK")
                     self.state = "TIME_WAIT"
                     with self.wait_cond:
                         self.wait_cond.notify_all()
                 with self.recv_lock:
+                    # 快速重传检测
+                    if packet.ack == self.last_ack_recv and self.state == "ESTABLISHED":
+                        self.dup_ack_count += 1
+                        if self.dup_ack_count == 3:  # 收到3个重复ACK
+                            print(f"检测到三重重复ACK ({packet.ack})，触发快速重传")
+                            # 查找需要重传的段
+                            if packet.ack in self.inflight:
+                                retrans_seg = self.inflight[packet.ack]
+                                segment = Packet(seq=packet.ack, ack=self.window["last_ack"], 
+                                              flags=0, payload=retrans_seg["payload"],
+                                              win=MAX_NETWORK_BUFFER - self.window["recv_len"])
+                                self.sock_fd.sendto(segment.encode(), addr)
+                                retrans_seg["trans"] += 1
+                                retrans_seg["send_time"] = time.time()
+                                retrans_seg["rtt_valid"] = False
+                                self.dup_ack_count = 0  # 重置计数器
+                    elif packet.ack > self.last_ack_recv:
+                        self.last_ack_recv = packet.ack
+                        self.dup_ack_count = 0  # 收到新ACK，重置计数器
+                    
+                    # 检查SACK信息
+                    if (packet.flags & SACK_FLAG) and packet.sack_left > 0 and packet.sack_right > packet.sack_left:
+                        self.last_sack_info = (packet.sack_left, packet.sack_right)
+                        print(f"接收到SACK信息：块[{packet.sack_left}-{packet.sack_right}]")
+                    
                     if packet.ack > self.window["next_seq_expected"]:
                         self.window["next_seq_expected"] = packet.ack
-                    self.peer_adv_wnd = packet.win if hasattr(packet, "win") else MAX_NETWORK_BUFFER
+                    self.peer_adv_wnd = packet.win
                     self.wait_cond.notify_all()
+                    
                 if len(packet.payload) == 0:
                     continue
 
             # Data packet processing
             if packet.seq == self.window["last_ack"]:
+                # 处理按序到达的数据
                 if self.window["recv_len"] + len(packet.payload) > MAX_NETWORK_BUFFER:
-                    print("Receive buffer full, dropping segment seq=%d" % packet.seq)
+                    print(f"接收缓冲区已满，丢弃段 seq={packet.seq}")
                     continue
+                
                 with self.recv_lock:
                     self.window["recv_buf"] += packet.payload
                     self.window["recv_len"] += len(packet.payload)
+                    next_expected = packet.seq + len(packet.payload)
+                    
+                    # 检查我们的乱序缓冲区中是否有可以现在处理的段
+                    while next_expected in self.ooo_segments:
+                        seg_len, seg_data = self.ooo_segments.pop(next_expected)
+                        print(f"从乱序缓冲区恢复段 (seq={next_expected})")
+                        self.window["recv_buf"] += seg_data
+                        self.window["recv_len"] += seg_len
+                        next_expected += seg_len
+                        
                 with self.wait_cond:
                     self.wait_cond.notify_all()
-                print(f"Received segment (seq={packet.seq}, {len(packet.payload)} bytes) - in order")
-                ack_val = packet.seq + len(packet.payload)
-                ack_pkt = Packet(seq=0, ack=ack_val, flags=ACK_FLAG, payload=b"",
-                                 win=MAX_NETWORK_BUFFER - self.window["recv_len"])
+                    
+                print(f"接收到按序段 (seq={packet.seq}, {len(packet.payload)} 字节)")
+                
+                # 确认我们已经接收的最高序列号
+                ack_val = next_expected
+                ack_flags = ACK_FLAG
+                
+                # 检查是否有乱序段需要通过SACK报告
+                sack_left, sack_right = 0, 0
+                ooo_seqs = sorted(self.ooo_segments.keys())
+                if ooo_seqs:
+                    first_ooo = ooo_seqs[0]
+                    sack_left = first_ooo
+                    seg_len, _ = self.ooo_segments[first_ooo]
+                    sack_right = first_ooo + seg_len
+                    ack_flags |= SACK_FLAG
+                    print(f"发送SACK信息：块[{sack_left}-{sack_right}]")
+                
+                ack_pkt = Packet(seq=0, ack=ack_val, flags=ack_flags, payload=b"",
+                               win=MAX_NETWORK_BUFFER - self.window["recv_len"],
+                               sack_left=sack_left, sack_right=sack_right)
                 self.sock_fd.sendto(ack_pkt.encode(), addr)
                 self.window["last_ack"] = ack_val
             else:
-                print(f"Out-of-order packet: seq={packet.seq}, expected={self.window['last_ack']}")
+                # 处理乱序数据包
+                if packet.seq > self.window["last_ack"]:
+                    # 数据在我们期望接收的序列号之后（乱序数据）
+                    if self.window["recv_len"] + len(packet.payload) <= MAX_NETWORK_BUFFER:
+                        print(f"接收到乱序段 (seq={packet.seq}，期望={self.window['last_ack']})")
+                        self.ooo_segments[packet.seq] = (len(packet.payload), packet.payload)
+                        
+                        # 发送带SACK信息的重复ACK
+                        dup_ack = Packet(seq=0, ack=self.window["last_ack"], flags=ACK_FLAG | SACK_FLAG,
+                                       payload=b"", win=MAX_NETWORK_BUFFER - self.window["recv_len"],
+                                       sack_left=packet.seq, sack_right=packet.seq + len(packet.payload))
+                        self.sock_fd.sendto(dup_ack.encode(), addr)
+                    else:
+                        print(f"缓冲区已满，丢弃乱序段 seq={packet.seq}")
+                else:
+                    # 数据在我们期望接收的序列号之前（重复数据）
+                    print(f"收到重复数据 (seq={packet.seq}，期望={self.window['last_ack']})")
+                    # 发送重复ACK
+                    dup_ack = Packet(seq=0, ack=self.window["last_ack"], flags=ACK_FLAG,
+                                   payload=b"", win=MAX_NETWORK_BUFFER - self.window["recv_len"])
+                    self.sock_fd.sendto(dup_ack.encode(), addr)
 
