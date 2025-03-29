@@ -33,16 +33,18 @@ class Packet:
         self.sack_right = sack_right  # Selective acknowledgment right boundary
 
     def encode(self):
-        """Encode the packet header and payload into bytes (network byte order)."""
-        # Pack header fields: seq (32b), ack (32b), flags (32b), win (16b), payload_len (16b), sack_left (32b), sack_right (32b)
-        header = struct.pack("!IIIHHII", self.seq, self.ack, self.flags, self.win, len(self.payload), self.sack_left, self.sack_right)
+        """对数据包头部和有效负载进行编码（网络字节序）。"""
+        # 正确格式: seq(32b), ack(32b), flags(8b), win(16b), sack_left(32b), sack_right(32b)
+        header = struct.pack("!IIBHII", self.seq, self.ack, self.flags, self.win, self.sack_left, self.sack_right)
         return header + self.payload
 
     @staticmethod
     def decode(data):
-        """Decode bytes into a Packet object (assumes fixed header format)."""
-        header_size = struct.calcsize("!IIIHHII")
-        seq, ack, flags, win, payload_len, sack_left, sack_right = struct.unpack("!IIIHHII", data[:header_size])
+        """将字节解码为Packet对象（假设固定头部格式）。"""
+        header_size = struct.calcsize("!IIBHII")
+        if len(data) < header_size:
+            return None
+        seq, ack, flags, win, sack_left, sack_right = struct.unpack("!IIBHII", data[:header_size])
         payload = data[header_size:]
         return Packet(seq, ack, flags, payload, win=win, sack_left=sack_left, sack_right=sack_right)
 
