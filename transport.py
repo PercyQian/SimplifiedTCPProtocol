@@ -541,3 +541,113 @@ class TransportSocket:
             with self.wait_cond:
                 self.wait_cond.notify_all()
 
+    def handle_data(self, packet, addr):
+        """
+        处理接收到的数据包
+        """
+        # 检查序列号是否为我们期望的下一个序列号
+        if packet.seq == self.window["last_ack"]:
+            with self.recv_lock:
+                # 将载荷添加到接收缓冲区
+                self.window["recv_buf"] += packet.payload
+                self.window["recv_len"] += len(packet.payload)
+                
+                # 更新期望的下一个序列号
+                self.window["last_ack"] += len(packet.payload)
+                
+                # 更新可用窗口大小
+                self.window["adv_window"] = MAX_NETWORK_BUFFER - self.window["recv_len"]
+            
+            # 通知等待的线程
+            with self.wait_cond:
+                self.wait_cond.notify_all()
+            
+            print(f"接收段 {packet.seq} 包含 {len(packet.payload)} 字节")
+            
+            # 发送确认
+            ack_packet = Packet(
+                seq=self.window["next_seq_to_send"],
+                ack=self.window["last_ack"],
+                flags=ACK_FLAG,
+                window=self.window["adv_window"]
+            )
+            self.sock_fd.sendto(ack_packet.encode(), addr)
+        else:
+            print(f"乱序包: seq={packet.seq}, 期望={self.window['last_ack']}")
+            # 发送重复ACK
+            ack_packet = Packet(
+                seq=self.window["next_seq_to_send"],
+                ack=self.window["last_ack"],
+                flags=ACK_FLAG,
+                window=self.window["adv_window"]
+            )
+            self.sock_fd.sendto(ack_packet.encode(), addr)
+
+    def handle_ack(self, packet):
+        """
+        处理ACK包
+        """
+        # 对SYN-RECEIVED状态的处理
+        if self.state == State.SYN_RECEIVED and packet.ack == self.window["next_seq_to_send"]:
+            print("三次握手完成，连接已建立")
+            self.state = State.ESTABLISHED
+            with self.wait_cond:
+                self.wait_cond.notify_all()
+            return
+        
+        # 对数据包的ACK处理
+        if packet.ack > self.window["next_seq_expected"]:
+            # 计算新确认的数据量
+            new_bytes_acked = packet.ack - self.window["next_seq_expected"]
+            self.window["next_seq_expected"] = packet.ack
+            
+            # 更新已确认的段，并测量RTT
+            for seq in list(self.unacked_segments.keys()):
+                if seq + len(self.unacked_segments[seq][1]) <= packet.ack:
+                    time_sent, data, _ = self.unacked_segments.pop(seq)
+                    # 更新RTT估计
+                    if seq + len(data) == packet.ack:  # 确认了整个段
+                        measured_rtt = time.time() - time_sent
+                        self.update_rtt(measured_rtt)
+            
+            # 更新飞行中的数据量
+            self.flight_size = max(0, self.flight_size - new_bytes_acked)
+            
+            # 拥塞控制 (简化版)
+            if self.cwnd < self.ssthresh:
+                # 慢启动阶段
+                self.cwnd += min(new_bytes_acked, MSS)
+            else:
+                # 拥塞避免阶段
+                self.cwnd += MSS * MSS / self.cwnd
+                
+            # 重置重复ACK计数
+            self.duplicate_acks = 0
+            
+            # 继续发送更多数据
+            self.send_from_buffer()
+            
+            # 如果所有数据都已确认，通知等待的线程
+            if not self.unacked_segments and not self.send_buffer:
+                with self.wait_cond:
+                    self.wait_cond.notify_all()
+        elif packet.ack == self.window["next_seq_expected"] and packet.ack > 0:
+            # 处理重复ACK
+            self.duplicate_acks += 1
+            if self.duplicate_acks >= 3:
+                # 快速重传
+                for seq, (_, data, _) in self.unacked_segments.items():
+                    if seq == self.window["next_seq_expected"]:
+                        print(f"快速重传段 (seq={seq})")
+                        retrans_packet = Packet(
+                            seq=seq,
+                            ack=self.window["last_ack"],
+                            flags=0,
+                            window=self.window["adv_window"],
+                            payload=data
+                        )
+                        self.sock_fd.sendto(retrans_packet.encode(), self.conn)
+                        # 更新重传时间
+                        self.unacked_segments[seq] = (time.time(), data, self.unacked_segments[seq][2])
+                        break
+
