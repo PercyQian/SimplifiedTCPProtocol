@@ -1,48 +1,62 @@
-# TCP性能测试
+# TCP Performance Testing
 
-本项目包含一个简化的TCP协议实现，并添加了拥塞控制算法（TCP Tahoe），可以用于生成TCP性能指标图表。
+This project contains a simplified TCP protocol implementation with congestion control algorithms (TCP Tahoe) that can be used to generate TCP performance metric graphs.
 
-## 特性
+## Features
 
-- 实现了基本的TCP连接管理（三次握手、四次挥手）
-- 实现了滑动窗口机制
-- 实现了TCP Tahoe风格的拥塞控制
-  - 慢启动
-  - 拥塞避免
-  - 快速重传
+- Basic TCP connection management (3-way handshake, 4-way connection termination)
+- Sliding window mechanism
+- TCP Tahoe style congestion control:
+  - Slow Start
+  - Congestion Avoidance
+  - Fast Retransmit
 
-## 性能指标
+## Performance Metrics
 
-测试脚本可生成以下性能指标图表：
+The test script generates the following performance metric graphs:
 
-1. 拥塞窗口(cwnd)和慢启动阈值(ssthresh)随时间的变化
-2. RTT随时间的变化
-3. 吞吐量随时间的变化
-4. 不同阶段拥塞窗口的增长情况
-5. 网络中未确认的数据量随时间的变化
+1. Congestion window (cwnd) and slow start threshold (ssthresh) over time
+2. Round Trip Time (RTT) over time
+3. Throughput over time
+4. Congestion window growth in different phases
+5. Unacknowledged data in network over time
 
-## 环境要求
+## Requirements
 
 - Python 3.6+
 - matplotlib
 - numpy
 
-## 安装依赖
+## Installing Dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## 运行测试
+## Running the Test
 
-测试脚本将启动一个服务器和一个客户端，通过TCP协议传输数据，并收集性能指标。
+The test script starts a server and a client, transmits data using the TCP protocol, and collects performance metrics.
 
 ```bash
 python tcp_performance_test.py
 ```
 
-## 结果
+### Sample Graphs
 
-执行测试后，将生成两个图表文件：
-- `tcp_performance.png`：包含RTT、吞吐量和拥塞窗口变化图表
-- `tcp_statistics.png`：包含拥塞控制阶段分析和未确认数据量图表 
+If you're having issues running the actual TCP test or just want to see example graphs, you can use the sample graph generator:
+
+```bash
+python generate_sample_graphs.py
+```
+
+This will create sample TCP performance graphs using simulated data that demonstrates the key behaviors of TCP Tahoe congestion control, including:
+- Slow start phase (exponential cwnd growth)
+- Congestion avoidance phase (linear cwnd growth)
+- Timeout and fast retransmit events
+- The effect of congestion events on RTT and throughput
+
+## Results
+
+After running the test, two pairs of graph files will be generated:
+- `tcp_performance.png` and `tcp_performance_sample.png`: Contains RTT, throughput, and congestion window graphs
+- `tcp_statistics.png` and `tcp_statistics_sample.png`: Contains congestion control phase analysis and unacknowledged data graphs 
