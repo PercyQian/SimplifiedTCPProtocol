@@ -3,6 +3,7 @@ import struct
 import threading
 import time
 from grading import MSS, DEFAULT_TIMEOUT, MAX_NETWORK_BUFFER, WINDOW_SIZE
+from grading import WINDOW_INITIAL_WINDOW_SIZE, WINDOW_INITIAL_SSTHRESH
 
 # Constants for simplified TCP flags
 SYN_FLAG = 0x8   # Synchronization (SYN) flag 
@@ -68,6 +69,11 @@ class TransportSocket:
             "next_seq_to_send": 0     # Sequence number for the next new byte we send
         }
         self.peer_adv_wnd = MAX_NETWORK_BUFFER  # Peer's advertised window (flow control)
+        # 拥塞控制相关变量
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE  # 拥塞窗口，初始设置为WINDOW_INITIAL_WINDOW_SIZE
+        self.ssthresh = WINDOW_INITIAL_SSTHRESH  # 慢启动阈值，初始设置为WINDOW_INITIAL_SSTHRESH
+        self.congestion_state = "SLOW_START"  # 拥塞控制状态：SLOW_START或CONGESTION_AVOIDANCE
+        
         self.state = "CLOSED"                   # Connection state (FSM)
         self.sock_type = None
         self.conn = None       # Peer address (IP, port)
@@ -91,6 +97,11 @@ class TransportSocket:
         """
         self.sock_fd = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock_type = sock_type
+
+        # 初始化拥塞控制参数
+        self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+        self.ssthresh = WINDOW_INITIAL_SSTHRESH
+        self.congestion_state = "SLOW_START"
 
         if sock_type == "TCP_INITIATOR":
             # Active open: initiate connection to server
@@ -256,9 +267,14 @@ class TransportSocket:
 
         while self.window["next_seq_expected"] < end_seq:
             # Send new segments if window space permits
-            while offset < total_len and (self.window["next_seq_to_send"] - self.window["next_seq_expected"] < self.peer_adv_wnd):
+            # 使用拥塞窗口和接收窗口的最小值作为发送窗口
+            effective_window = min(self.cwnd, self.peer_adv_wnd)
+            
+            # 检查应用层缓冲区大小是否在限制范围内
+            bytes_in_flight = self.window["next_seq_to_send"] - self.window["next_seq_expected"]
+            while offset < total_len and (bytes_in_flight < effective_window) and (self.window["recv_len"] < MAX_NETWORK_BUFFER):
                 payload_len = min(MSS, total_len - offset,
-                                  self.peer_adv_wnd - (self.window["next_seq_to_send"] - self.window["next_seq_expected"]))
+                              effective_window - bytes_in_flight)
                 if payload_len <= 0:
                     break
                 seq_no = self.window["next_seq_to_send"]
@@ -267,12 +283,13 @@ class TransportSocket:
                     ack_no = self.window["last_ack"]
                     recv_win = MAX_NETWORK_BUFFER - self.window["recv_len"]
                 segment = Packet(seq=seq_no, ack=ack_no, flags=0, payload=chunk, win=recv_win)
-                print(f"Sending segment (seq={seq_no}, len={payload_len})")
+                print(f"Sending segment (seq={seq_no}, len={payload_len}, cwnd={self.cwnd}, state={self.congestion_state})")
                 self.sock_fd.sendto(segment.encode(), self.conn)
                 send_time = time.time()
                 self.inflight[seq_no] = {"payload": chunk, "send_time": send_time, "trans": 1, "rtt_valid": True}
                 self.window["next_seq_to_send"] += payload_len
                 offset += payload_len
+                bytes_in_flight = self.window["next_seq_to_send"] - self.window["next_seq_expected"]
 
             with self.recv_lock:
                 start_wait = time.time()
@@ -282,6 +299,15 @@ class TransportSocket:
                     break
                 timeout_occurred = (elapsed >= self.timeout_interval)
             if timeout_occurred:
+                # 超时发生时的拥塞控制处理：类似TCP Tahoe
+                # 将ssthresh设置为当前拥塞窗口的一半（至少为2*MSS）
+                self.ssthresh = max(2 * MSS, self.cwnd // 2)
+                # 将拥塞窗口重置为初始值
+                self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+                # 切换到慢启动状态
+                self.congestion_state = "SLOW_START"
+                print(f"Timeout: Entering slow start, cwnd={self.cwnd}, ssthresh={self.ssthresh}")
+                
                 # Check if connection is terminating; if yes, break out.
                 if self.state in ("TIME_WAIT", "CLOSED"):
                     print("Connection terminating; stopping retransmissions.")
@@ -303,6 +329,31 @@ class TransportSocket:
             # Process ACKs and update RTT estimates
             base = self.window["next_seq_expected"]
             acked_seqs = [seq for seq in list(self.inflight.keys()) if seq < base]
+            
+            # 收到新ACK后更新拥塞窗口
+            if acked_seqs:
+                # 计算这次确认了多少数据（字节）
+                bytes_acked = sum([len(self.inflight[seq]["payload"]) for seq in acked_seqs])
+                
+                # 根据当前拥塞状态更新拥塞窗口
+                if self.congestion_state == "SLOW_START":
+                    # 慢启动：每收到一个ACK, cwnd增加1个MSS
+                    # 累积确认情况下，每收到一个包含n个段的ACK，cwnd增加n个MSS
+                    segments_acked = (bytes_acked + MSS - 1) // MSS  # 向上取整
+                    self.cwnd += segments_acked * MSS
+                    
+                    # 检查是否应该转换为拥塞避免状态
+                    if self.cwnd >= self.ssthresh:
+                        self.congestion_state = "CONGESTION_AVOIDANCE"
+                        print(f"Entering congestion avoidance, cwnd={self.cwnd}, ssthresh={self.ssthresh}")
+                        
+                elif self.congestion_state == "CONGESTION_AVOIDANCE":
+                    # 拥塞避免：每个RTT增加一个MSS
+                    # 对于每个确认，增加的量为MSS * (MSS/cwnd)
+                    # 假设每个段是一个MSS
+                    segments_acked = (bytes_acked + MSS - 1) // MSS  # 向上取整
+                    self.cwnd += segments_acked * MSS * MSS / self.cwnd
+            
             for seq in sorted(acked_seqs):
                 seg_info = self.inflight.pop(seq)
                 if seg_info["rtt_valid"]:
@@ -410,6 +461,14 @@ class TransportSocket:
                         self.dup_ack_count += 1
                         if self.dup_ack_count == 3:  # Received 3 duplicate ACKs
                             print(f"Detected triple duplicate ACK ({packet.ack}), triggering fast retransmit")
+                            # 快速重传时的拥塞控制处理：TCP Tahoe方式
+                            # 进入快速恢复之前，将ssthresh设置为当前cwnd的一半
+                            self.ssthresh = max(2 * MSS, self.cwnd // 2)
+                            # TCP Tahoe在快速重传后回到慢启动
+                            self.cwnd = WINDOW_INITIAL_WINDOW_SIZE
+                            self.congestion_state = "SLOW_START"
+                            print(f"Fast retransmit: Entering slow start, cwnd={self.cwnd}, ssthresh={self.ssthresh}")
+                            
                             # Find segment to retransmit
                             if packet.ack in self.inflight:
                                 retrans_seg = self.inflight[packet.ack]
