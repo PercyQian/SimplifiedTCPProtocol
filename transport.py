@@ -88,6 +88,16 @@ class TransportSocket:
         # Fast retransmit variables
         self.dup_ack_count = 0  # Duplicate ACK count
         self.last_ack_recv = 0  # Last received ACK number
+        # 性能监控变量
+        self.performance_data = {
+            "timestamp": [],       # 时间戳
+            "rtt": [],             # RTT测量值
+            "cwnd": [],            # 拥塞窗口大小
+            "bytes_sent": [],      # 已发送字节数
+            "bytes_acked": [],     # 已确认字节数
+            "ssthresh": []         # 慢启动阈值
+        }
+        self.start_time = None     # 传输开始时间
 
     def socket(self, sock_type, port, server_ip=None):
         """
@@ -260,10 +270,23 @@ class TransportSocket:
         Send 'data' in segments using a sliding window and wait for ACKs.
         Implements retransmission with adaptive timeout.
         """
+        # 记录传输开始时间
+        if self.start_time is None:
+            self.start_time = time.time()
+        
         offset = 0
         total_len = len(data)
         base_seq = self.window["next_seq_expected"]
         end_seq = base_seq + total_len
+        
+        # 记录初始性能指标
+        curr_time = time.time() - self.start_time
+        self.performance_data["timestamp"].append(curr_time)
+        self.performance_data["cwnd"].append(self.cwnd)
+        self.performance_data["ssthresh"].append(self.ssthresh)
+        self.performance_data["rtt"].append(self.estimated_rtt)
+        self.performance_data["bytes_sent"].append(self.window["next_seq_to_send"])
+        self.performance_data["bytes_acked"].append(self.window["next_seq_expected"])
 
         while self.window["next_seq_expected"] < end_seq:
             # Send new segments if window space permits
@@ -324,6 +347,14 @@ class TransportSocket:
                     seg_info["rtt_valid"] = False
                     seg_info["send_time"] = time.time()
                     self.timeout_interval = min(self.timeout_interval * 2, 60)
+                # 记录超时后的性能指标
+                curr_time = time.time() - self.start_time
+                self.performance_data["timestamp"].append(curr_time)
+                self.performance_data["cwnd"].append(self.cwnd)
+                self.performance_data["ssthresh"].append(self.ssthresh)
+                self.performance_data["rtt"].append(self.estimated_rtt)
+                self.performance_data["bytes_sent"].append(self.window["next_seq_to_send"])
+                self.performance_data["bytes_acked"].append(self.window["next_seq_expected"])
                 continue
 
             # Process ACKs and update RTT estimates
@@ -354,6 +385,15 @@ class TransportSocket:
                     segments_acked = (bytes_acked + MSS - 1) // MSS  # 向上取整
                     self.cwnd += segments_acked * MSS * MSS / self.cwnd
             
+                # 记录ACK后的性能指标
+                curr_time = time.time() - self.start_time
+                self.performance_data["timestamp"].append(curr_time)
+                self.performance_data["cwnd"].append(self.cwnd)
+                self.performance_data["ssthresh"].append(self.ssthresh)
+                self.performance_data["rtt"].append(self.estimated_rtt)
+                self.performance_data["bytes_sent"].append(self.window["next_seq_to_send"])
+                self.performance_data["bytes_acked"].append(self.window["next_seq_expected"])
+
             for seq in sorted(acked_seqs):
                 seg_info = self.inflight.pop(seq)
                 if seg_info["rtt_valid"]:
@@ -480,6 +520,15 @@ class TransportSocket:
                                 retrans_seg["send_time"] = time.time()
                                 retrans_seg["rtt_valid"] = False
                                 self.dup_ack_count = 0  # Reset counter
+                                # 记录快速重传后的性能指标
+                                if self.start_time is not None:
+                                    curr_time = time.time() - self.start_time
+                                    self.performance_data["timestamp"].append(curr_time)
+                                    self.performance_data["cwnd"].append(self.cwnd)
+                                    self.performance_data["ssthresh"].append(self.ssthresh)
+                                    self.performance_data["rtt"].append(self.estimated_rtt)
+                                    self.performance_data["bytes_sent"].append(self.window["next_seq_to_send"])
+                                    self.performance_data["bytes_acked"].append(self.window["next_seq_expected"])
                     elif packet.ack > self.last_ack_recv:
                         self.last_ack_recv = packet.ack
                         self.dup_ack_count = 0  # New ACK received, reset counter
@@ -553,4 +602,32 @@ class TransportSocket:
                     dup_ack = Packet(seq=0, ack=self.window["last_ack"], flags=ACK_FLAG,
                                    payload=b"", win=MAX_NETWORK_BUFFER - self.window["recv_len"])
                     self.sock_fd.sendto(dup_ack.encode(), addr)
+
+    def get_performance_data(self):
+        """获取性能指标数据，用于生成图表"""
+        return self.performance_data
+        
+    def calculate_throughput(self):
+        """计算吞吐量数据，返回时间和吞吐量序列"""
+        if not self.performance_data["timestamp"] or not self.performance_data["bytes_acked"]:
+            return [], []
+            
+        # 计算时间窗口内的吞吐量（每秒确认的字节数）
+        times = []
+        throughput = []
+        window_size = 0.5  # 500ms窗口
+        
+        for i in range(1, len(self.performance_data["timestamp"])):
+            curr_time = self.performance_data["timestamp"][i]
+            prev_time = self.performance_data["timestamp"][i-1]
+            time_diff = curr_time - prev_time
+            
+            if time_diff > 0:
+                bytes_acked_diff = self.performance_data["bytes_acked"][i] - self.performance_data["bytes_acked"][i-1]
+                curr_throughput = bytes_acked_diff / time_diff  # 字节/秒
+                
+                times.append(curr_time)
+                throughput.append(curr_throughput)
+        
+        return times, throughput
 
